@@ -52,10 +52,60 @@ export interface VersionSnapshot {
   draft: LanguageDraft
 }
 
+export type HandoverAspect = 'title' | 'narration' | 'segments'
+
+export interface LockedSegmentSnapshot {
+  id: string
+  label: string
+  content: string
+}
+
+export interface BaselineEntry {
+  languageId: string
+  title: string
+  narration: string
+  lockedSegments: LockedSegmentSnapshot[]
+}
+
+export interface HandoverBaseline {
+  id: string
+  exhibitId: string
+  createdAt: string
+  entries: BaselineEntry[]
+}
+
+export interface RevisionEntry {
+  id: string
+  exhibitId: string
+  languageId: string
+  summary: string
+  note: string
+  aspects: HandoverAspect[]
+  createdAt: string
+}
+
+export interface LanguageHandover {
+  languageId: string
+  missing: boolean
+  addedAfterBaseline: boolean
+  changedAspects: HandoverAspect[]
+  undocumentedAspects: HandoverAspect[]
+}
+
+export interface HandoverReport {
+  baseline?: HandoverBaseline
+  languages: LanguageHandover[]
+  revisions: RevisionEntry[]
+  ready: boolean
+  blockers: string[]
+}
+
 export interface PersistedState {
   halls: Hall[]
   exhibits: Exhibit[]
   versions: VersionSnapshot[]
+  baselines: HandoverBaseline[]
+  revisions: RevisionEntry[]
   selectedHallId: string
   selectedExhibitId: string
   selectedLanguageId: string

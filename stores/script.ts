@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, ScriptStatus, Segment, VersionSnapshot } from '~/types'
+import type { Exhibit, Hall, HandoverAspect, HandoverBaseline, HandoverReport, Language, LanguageDraft, LanguageHandover, LockedSegmentSnapshot, PersistedState, RevisionEntry, ScriptStatus, Segment, VersionSnapshot } from '~/types'
 
 export const LANGUAGES: Language[] = [
   { id: 'zh', code: 'zh-CN', label: '简体中文', shortLabel: '中' },
@@ -7,7 +7,50 @@ export const LANGUAGES: Language[] = [
   { id: 'ja', code: 'ja-JP', label: '日本語', shortLabel: '日' }
 ]
 
+export const ASPECT_LABELS: Record<HandoverAspect, string> = { title: '标题', narration: '正文', segments: '锁定段落' }
+
 const STORAGE_KEY = 'museum-script-studio-v1'
+
+function lockedSegmentSnapshots(draft: LanguageDraft): LockedSegmentSnapshot[] {
+  return draft.segments.filter(segment => segment.locked).map(segment => ({ id: segment.id, label: segment.label, content: segment.content }))
+}
+
+export function buildHandoverReport(exhibit: Exhibit, baselines: HandoverBaseline[], revisions: RevisionEntry[]): HandoverReport {
+  const baseline = baselines.find(item => item.exhibitId === exhibit.id)
+  const exhibitRevisions = revisions
+    .filter(item => item.exhibitId === exhibit.id)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  const languages: LanguageHandover[] = LANGUAGES.map(language => {
+    const draft = exhibit.drafts.find(item => item.languageId === language.id)
+    const missing = !draft || !draft.title.trim() || !draft.narration.trim()
+    const entry = baseline?.entries.find(item => item.languageId === language.id)
+    const changedAspects: HandoverAspect[] = []
+    if (baseline && draft) {
+      const locked = lockedSegmentSnapshots(draft)
+      if (!entry) {
+        if (draft.title.trim()) changedAspects.push('title')
+        if (draft.narration.trim()) changedAspects.push('narration')
+        if (locked.length) changedAspects.push('segments')
+      } else {
+        if (draft.title !== entry.title) changedAspects.push('title')
+        if (draft.narration !== entry.narration) changedAspects.push('narration')
+        if (JSON.stringify(locked) !== JSON.stringify(entry.lockedSegments)) changedAspects.push('segments')
+      }
+    }
+    const documented = new Set(exhibitRevisions.filter(item => item.languageId === language.id).flatMap(item => item.aspects))
+    const undocumentedAspects = changedAspects.filter(aspect => !documented.has(aspect))
+    return { languageId: language.id, missing, addedAfterBaseline: Boolean(baseline && draft && !entry), changedAspects, undocumentedAspects }
+  })
+  const blockers: string[] = []
+  if (!baseline) blockers.push('尚未建立交接基线')
+  languages.forEach((report, index) => {
+    const label = LANGUAGES[index].label
+    if (report.missing) blockers.push(`${label}缺稿`)
+    report.undocumentedAspects.forEach(aspect => blockers.push(`${label}的${ASPECT_LABELS[aspect]}改动未登记说明`))
+  })
+  const ready = Boolean(baseline) && languages.every(report => !report.missing && report.undocumentedAspects.length === 0)
+  return { baseline, languages, revisions: exhibitRevisions, ready, blockers }
+}
 
 const segments = (prefix: string, values: Array<[string, string, boolean?]>): Segment[] => values.map(([label, content, locked], index) => ({
   id: `${prefix}-${index + 1}`,
@@ -107,6 +150,8 @@ function demoState(): PersistedState {
     halls,
     exhibits,
     versions: [],
+    baselines: [],
+    revisions: [],
     selectedHallId: halls[0].id,
     selectedExhibitId: exhibits[0].id,
     selectedLanguageId: 'zh',
@@ -119,6 +164,8 @@ export const useScriptStore = defineStore('museum-script', {
     halls: [] as Hall[],
     exhibits: [] as Exhibit[],
     versions: [] as VersionSnapshot[],
+    baselines: [] as HandoverBaseline[],
+    revisions: [] as RevisionEntry[],
     selectedHallId: '',
     selectedExhibitId: '',
     selectedLanguageId: 'zh',
@@ -144,6 +191,12 @@ export const useScriptStore = defineStore('museum-script', {
     wordCount(): number {
       return (this.selectedDraft?.narration || '').replace(/\s/g, '').length
     },
+    baselineFor(state) {
+      return (exhibitId: string): HandoverBaseline | undefined => state.baselines.find(item => item.exhibitId === exhibitId)
+    },
+    handoverReport(state) {
+      return (exhibit: Exhibit): HandoverReport => buildHandoverReport(exhibit, state.baselines, state.revisions)
+    },
     canUndo(state): boolean { return state.past.length > 0 },
     canRedo(state): boolean { return state.future.length > 0 }
   },
@@ -155,6 +208,8 @@ export const useScriptStore = defineStore('museum-script', {
         try {
           const data = JSON.parse(saved) as PersistedState
           this.$patch({ ...data, hydrated: true })
+          if (!Array.isArray(this.baselines)) this.baselines = []
+          if (!Array.isArray(this.revisions)) this.revisions = []
           if (!this.halls.length || !this.exhibits.length) this.resetDemo()
         } catch {
           this.resetDemo()
@@ -185,6 +240,7 @@ export const useScriptStore = defineStore('museum-script', {
       if (typeof localStorage === 'undefined') return
       const data: PersistedState = {
         halls: this.halls, exhibits: this.exhibits, versions: this.versions,
+        baselines: this.baselines, revisions: this.revisions,
         selectedHallId: this.selectedHallId, selectedExhibitId: this.selectedExhibitId,
         selectedLanguageId: this.selectedLanguageId, lastSavedAt: this.lastSavedAt
       }
@@ -213,33 +269,90 @@ export const useScriptStore = defineStore('museum-script', {
       this.selectedLanguageId = id
       this.persist()
     },
-    updateDraft(patch: Partial<Pick<LanguageDraft, 'title' | 'narration' | 'accessibility' | 'durationMinutes' | 'sources'>>) {
+    updateDraft(patch: Partial<Pick<LanguageDraft, 'title' | 'narration' | 'accessibility' | 'durationMinutes' | 'sources'>>, note?: string) {
       const draft = this.selectedDraft
-      if (!draft) return
-      this.commit(() => Object.assign(draft, patch, { updatedAt: new Date().toISOString() }))
-      this.notice = '改动已自动保存到浏览器。'
+      const exhibit = this.selectedExhibit
+      if (!draft || !exhibit) return false
+      const tracked = (['title', 'narration'] as const).filter(field => field in patch && patch[field] !== draft[field])
+      const baseline = this.baselines.find(item => item.exhibitId === exhibit.id)
+      if (baseline && tracked.length && !note?.trim()) {
+        this.notice = '交接基线已建立：请填写修订说明后再保存，本次改动未写入。'
+        return false
+      }
+      this.commit(() => {
+        Object.assign(draft, patch, { updatedAt: new Date().toISOString() })
+        if (baseline && tracked.length && note) {
+          this.logRevision(exhibit.id, draft.languageId, tracked.map(field => field === 'title' ? '更新展项标题' : '更新讲解词正文').join('、'), [...tracked], note)
+        }
+      })
+      this.notice = baseline && tracked.length ? '改动已保存，并登记了修订说明。' : '改动已自动保存到浏览器。'
+      return true
     },
-    updateSegment(id: string, patch: Partial<Pick<Segment, 'label' | 'content'>>) {
-      const segment = this.selectedDraft?.segments.find(item => item.id === id)
-      if (!segment || segment.locked) return
-      this.commit(() => Object.assign(segment, patch))
-    },
-    toggleLock(id: string) {
-      const segment = this.selectedDraft?.segments.find(item => item.id === id)
-      if (!segment) return
-      this.commit(() => { segment.locked = !segment.locked })
-      this.notice = segment.locked ? '段落已锁定，避免误改。' : '段落已解锁。'
-    },
-    addSegment() {
+    updateSegment(id: string, patch: Partial<Pick<Segment, 'label' | 'content'>>, note?: string) {
       const draft = this.selectedDraft
-      if (!draft) return
-      this.commit(() => draft.segments.push({ id: `segment-${Date.now()}`, label: `新段落 ${draft.segments.length + 1}`, content: '', locked: false }))
-    },
-    removeSegment(id: string) {
-      const draft = this.selectedDraft
+      const exhibit = this.selectedExhibit
       const segment = draft?.segments.find(item => item.id === id)
-      if (!draft || !segment || segment.locked) return
-      this.commit(() => { draft.segments = draft.segments.filter(item => item.id !== id) })
+      if (!draft || !exhibit || !segment || segment.locked) return false
+      const baseline = this.baselines.find(item => item.exhibitId === exhibit.id)
+      if (baseline && !note?.trim()) {
+        this.notice = '交接基线已建立：请填写修订说明后再保存，本次改动未写入。'
+        return false
+      }
+      this.commit(() => {
+        Object.assign(segment, patch)
+        if (baseline && note) this.logRevision(exhibit.id, draft.languageId, `编辑段落「${segment.label || '未命名段落'}」`, ['segments'], note)
+      })
+      this.notice = baseline ? '段落改动已保存，并登记了修订说明。' : '改动已自动保存到浏览器。'
+      return true
+    },
+    toggleLock(id: string, note?: string) {
+      const draft = this.selectedDraft
+      const exhibit = this.selectedExhibit
+      const segment = draft?.segments.find(item => item.id === id)
+      if (!draft || !exhibit || !segment) return false
+      const baseline = this.baselines.find(item => item.exhibitId === exhibit.id)
+      if (baseline && !note?.trim()) {
+        this.notice = '交接基线已建立：请填写修订说明后再调整锁定，本次改动未写入。'
+        return false
+      }
+      this.commit(() => {
+        segment.locked = !segment.locked
+        if (baseline && note) this.logRevision(exhibit.id, draft.languageId, `${segment.locked ? '锁定' : '解锁'}段落「${segment.label || '未命名段落'}」`, ['segments'], note)
+      })
+      this.notice = segment.locked ? '段落已锁定，避免误改。' : '段落已解锁。'
+      return true
+    },
+    addSegment(note?: string) {
+      const draft = this.selectedDraft
+      const exhibit = this.selectedExhibit
+      if (!draft || !exhibit) return false
+      const baseline = this.baselines.find(item => item.exhibitId === exhibit.id)
+      if (baseline && !note?.trim()) {
+        this.notice = '交接基线已建立：请填写修订说明后再新增段落。'
+        return false
+      }
+      this.commit(() => {
+        draft.segments.push({ id: `segment-${Date.now()}`, label: `新段落 ${draft.segments.length + 1}`, content: '', locked: false })
+        if (baseline && note) this.logRevision(exhibit.id, draft.languageId, '新增段落', ['segments'], note)
+      })
+      this.notice = baseline ? '段落已新增，并登记了修订说明。' : '已新增段落。'
+      return true
+    },
+    removeSegment(id: string, note?: string) {
+      const draft = this.selectedDraft
+      const exhibit = this.selectedExhibit
+      const segment = draft?.segments.find(item => item.id === id)
+      if (!draft || !exhibit || !segment || segment.locked) return false
+      const baseline = this.baselines.find(item => item.exhibitId === exhibit.id)
+      if (baseline && !note?.trim()) {
+        this.notice = '交接基线已建立：请填写修订说明后再删除段落。'
+        return false
+      }
+      this.commit(() => {
+        draft.segments = draft.segments.filter(item => item.id !== id)
+        if (baseline && note) this.logRevision(exhibit.id, draft.languageId, `删除段落「${segment.label || '未命名段落'}」`, ['segments'], note)
+      })
+      return true
     },
     setStatus(status: ScriptStatus) {
       const draft = this.selectedDraft
@@ -264,9 +377,14 @@ export const useScriptStore = defineStore('museum-script', {
       this.commit(() => this.versions.unshift(version))
       this.notice = '已保存当前版本，可在版本页比较或恢复。'
     },
-    restoreVersion(id: string) {
+    restoreVersion(id: string, note?: string) {
       const version = this.versions.find(item => item.id === id)
-      if (!version) return
+      if (!version) return false
+      const baseline = this.baselines.find(item => item.exhibitId === version.exhibitId)
+      if (baseline && !note?.trim()) {
+        this.notice = '交接基线已建立：请填写修订说明后再恢复版本。'
+        return false
+      }
       this.commit(() => {
         const exhibit = this.exhibits.find(item => item.id === version.exhibitId)
         if (!exhibit) return
@@ -274,10 +392,74 @@ export const useScriptStore = defineStore('museum-script', {
         const restored = JSON.parse(JSON.stringify(version.draft)) as LanguageDraft
         if (index >= 0) exhibit.drafts[index] = restored
         else exhibit.drafts.push(restored)
+        if (baseline && note) this.logRevision(version.exhibitId, version.languageId, `恢复版本「${version.name}」`, ['title', 'narration', 'segments'], note)
       })
       this.selectedExhibitId = version.exhibitId
       this.selectedLanguageId = version.languageId
       this.notice = '版本已恢复，并作为一次可撤销操作保存。'
+      return true
+    },
+    createDraft(languageId: string, note?: string) {
+      const exhibit = this.selectedExhibit
+      const language = LANGUAGES.find(item => item.id === languageId)
+      if (!exhibit || !language || exhibit.drafts.some(item => item.languageId === languageId)) return false
+      const baseline = this.baselines.find(item => item.exhibitId === exhibit.id)
+      if (baseline && !note?.trim()) {
+        this.notice = '交接基线已建立：请填写修订说明后再新建稿件。'
+        return false
+      }
+      this.commit(() => {
+        exhibit.drafts.push({
+          id: `draft-${exhibit.id}-${languageId}-${Date.now()}`,
+          languageId,
+          title: '',
+          narration: '',
+          accessibility: '',
+          durationMinutes: 1,
+          sources: '',
+          status: 'draft',
+          segments: [],
+          updatedAt: new Date().toISOString()
+        })
+        if (baseline && note) this.logRevision(exhibit.id, languageId, `新建${language.label}稿件`, [], note)
+      })
+      this.selectedLanguageId = languageId
+      this.persist()
+      this.notice = `已新建${language.label}稿件，请补全标题与正文。`
+      return true
+    },
+    establishBaseline() {
+      const exhibit = this.selectedExhibit
+      if (!exhibit) return
+      const baseline: HandoverBaseline = {
+        id: `baseline-${Date.now()}`,
+        exhibitId: exhibit.id,
+        createdAt: new Date().toISOString(),
+        entries: exhibit.drafts.map(draft => ({
+          languageId: draft.languageId,
+          title: draft.title,
+          narration: draft.narration,
+          lockedSegments: lockedSegmentSnapshots(draft)
+        }))
+      }
+      this.commit(() => {
+        this.baselines = [...this.baselines.filter(item => item.exhibitId !== exhibit.id), baseline]
+        this.revisions = this.revisions.filter(item => item.exhibitId !== exhibit.id)
+      })
+      this.past = []
+      this.future = []
+      this.notice = '交接基线已建立：已记录三种语言当前的标题、正文和锁定段落，之后修改需填写修订说明。'
+    },
+    logRevision(exhibitId: string, languageId: string, summary: string, aspects: HandoverAspect[], note: string) {
+      this.revisions.unshift({
+        id: `revision-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        exhibitId,
+        languageId,
+        summary,
+        note: note.trim(),
+        aspects,
+        createdAt: new Date().toISOString()
+      })
     },
     undo() {
       const state = this.past.pop()
