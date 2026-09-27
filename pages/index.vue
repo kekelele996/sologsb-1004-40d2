@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment } from '~/types'
-import { LANGUAGES, useScriptStore } from '~/stores/script'
+import type { DeviceKind, DiffLine, HandoverField, LanguageDraft, ScriptStatus, Segment } from '~/types'
+import { HANDOVER_FIELD_LABELS, LANGUAGES, useScriptStore } from '~/stores/script'
 
 const store = useScriptStore()
 const activeTab = ref('editor')
@@ -12,6 +12,23 @@ const compareA = ref('')
 const compareB = ref('')
 const helpDialog = ref(false)
 const deleteTarget = ref<string | null>(null)
+const baselineDialog = ref(false)
+const revisionDialog = ref(false)
+const revisionNote = ref('')
+const remountKey = ref(0)
+
+type PendingRevision =
+  | { kind: 'field'; field: 'title' | 'narration'; value: string }
+  | { kind: 'lock'; segmentId: string }
+  | { kind: 'restore'; versionId: string }
+const pendingRevision = ref<PendingRevision | null>(null)
+const pendingKindLabel = computed(() => {
+  const pending = pendingRevision.value
+  if (!pending) return ''
+  if (pending.kind === 'field') return HANDOVER_FIELD_LABELS[pending.field]
+  if (pending.kind === 'lock') return '段落锁定'
+  return '恢复版本'
+})
 
 const statusOptions: Array<{ value: ScriptStatus; label: string; color: string }> = [
   { value: 'draft', label: '草稿', color: 'grey' },
@@ -32,6 +49,8 @@ const currentLanguage = computed(() => LANGUAGES.find(item => item.id === store.
 const currentStatus = computed(() => statusOptions.find(item => item.value === draft.value?.status) || statusOptions[0])
 const filteredExhibits = computed(() => store.hallExhibits.filter(item => !leftFilter.value || `${item.code} ${item.title}`.toLowerCase().includes(leftFilter.value.toLowerCase())))
 const versions = computed(() => store.versions.filter(item => item.exhibitId === store.selectedExhibitId && item.languageId === store.selectedLanguageId))
+const handoverReport = computed(() => store.handoverReport(store.selectedExhibitId))
+const handoverRows = computed(() => handoverReport.value.rows)
 const selectedVersionA = computed(() => versions.value.find(item => item.id === compareA.value))
 const selectedVersionB = computed(() => versions.value.find(item => item.id === compareB.value))
 const diffLines = computed<DiffLine[]>(() => {
@@ -70,7 +89,65 @@ function handleKeydown(event: KeyboardEvent) {
 }
 function saveDraftField(field: 'title' | 'narration' | 'accessibility' | 'durationMinutes' | 'sources', event: Event) {
   const value = (event.target as HTMLInputElement | HTMLTextAreaElement).value
-  store.updateDraft({ [field]: field === 'durationMinutes' ? Number(value) : value } as Partial<LanguageDraft>)
+  const patch = { [field]: field === 'durationMinutes' ? Number(value) : value } as Partial<LanguageDraft>
+  if (field === 'title' || field === 'narration') {
+    const current = field === 'title' ? draft.value?.title : draft.value?.narration
+    if (value !== (current ?? '') && handoverReport.value.baseline) {
+      pendingRevision.value = { kind: 'field', field, value }
+      revisionNote.value = ''
+      revisionDialog.value = true
+      return
+    }
+  }
+  store.updateDraft(patch)
+}
+function confirmRevision() {
+  const note = revisionNote.value.trim()
+  const pending = pendingRevision.value
+  if (!note || !pending) return
+  if (pending.kind === 'field') {
+    store.updateDraft({ [pending.field]: pending.value } as Partial<LanguageDraft>, note)
+  } else if (pending.kind === 'lock') {
+    store.toggleLock(pending.segmentId, note)
+  } else if (pending.kind === 'restore') {
+    store.restoreVersion(pending.versionId, note)
+  }
+  closeRevisionDialog()
+}
+function closeRevisionDialog() {
+  // 放弃改动：重新挂载输入框，使其回到已保存的值
+  remountKey.value++
+  revisionDialog.value = false
+  pendingRevision.value = null
+  revisionNote.value = ''
+}
+function requestToggleLock(segmentId: string) {
+  if (handoverReport.value.baseline) {
+    pendingRevision.value = { kind: 'lock', segmentId }
+    revisionNote.value = ''
+    revisionDialog.value = true
+  } else {
+    store.toggleLock(segmentId)
+  }
+}
+function requestRestoreVersion(versionId: string) {
+  if (handoverReport.value.baseline) {
+    pendingRevision.value = { kind: 'restore', versionId }
+    revisionNote.value = ''
+    revisionDialog.value = true
+  } else {
+    store.restoreVersion(versionId)
+  }
+}
+function establishBaseline() {
+  store.establishBaseline()
+  baselineDialog.value = false
+}
+function languageLabel(languageId: string) {
+  return LANGUAGES.find(item => item.id === languageId)?.label || languageId
+}
+function fieldRows(row: typeof handoverRows.value[number]) {
+  return (['title', 'narration', 'segments'] as HandoverField[]).map(field => ({ field, ...row.fields[field] }))
 }
 function saveSegment(id: string, field: 'label' | 'content', event: Event) {
   store.updateSegment(id, { [field]: (event.target as HTMLInputElement | HTMLTextAreaElement).value })
@@ -198,12 +275,13 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
           <v-tab value="versions">版本比较</v-tab>
           <v-tab value="preview">设备预览</v-tab>
           <v-tab value="sources">资料核对</v-tab>
+          <v-tab value="handover">交接</v-tab>
         </v-tabs>
 
-        <div v-if="draft">
+        <div>
           <v-window v-model="activeTab" :touch="false">
             <v-window-item value="editor">
-              <v-row>
+              <v-row v-if="draft">
                 <v-col cols="12" lg="8">
                   <v-card class="script-card pa-4 pa-md-6">
                     <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-5">
@@ -226,7 +304,7 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                       </div>
                     </div>
 
-                    <v-text-field label="展项标题" :model-value="draft.title" hint="面向观众的主标题" persistent-hint @change="saveDraftField('title', $event)" />
+                    <v-text-field :key="`title-${remountKey}`" label="展项标题" :model-value="draft.title" hint="面向观众的主标题（基线后修改需填写修订说明）" persistent-hint @change="saveDraftField('title', $event)" />
                     <v-row class="mt-2">
                       <v-col cols="12" md="5">
                         <v-text-field label="预计朗读时长（分钟）" type="number" min="0" step="0.5" :model-value="draft.durationMinutes" @change="saveDraftField('durationMinutes', $event)" />
@@ -237,7 +315,7 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                     </v-row>
 
                     <div class="section-title mt-6 mb-2">完整讲解词</div>
-                    <v-textarea label="讲解词" rows="7" auto-grow counter :model-value="draft.narration" @change="saveDraftField('narration', $event)" />
+                    <v-textarea :key="`narration-${remountKey}`" label="讲解词" rows="7" auto-grow counter hint="基线后修改需填写修订说明" persistent-hint :model-value="draft.narration" @change="saveDraftField('narration', $event)" />
 
                     <div class="section-title mt-6 mb-2">无障碍描述</div>
                     <v-textarea label="无障碍描述" rows="4" auto-grow hint="描述尺寸、材质、色彩与可触摸特征，避免只依赖视觉" persistent-hint :model-value="draft.accessibility" @change="saveDraftField('accessibility', $event)" />
@@ -254,7 +332,7 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                     <div class="d-flex flex-column ga-3">
                       <div v-for="(segment, index) in draft.segments" :key="segment.id" class="segment-row" :class="{ locked: segment.locked }">
                         <div class="d-flex align-center ga-2">
-                          <v-btn icon size="small" variant="text" :aria-label="segment.locked ? '解锁段落' : '锁定段落'" @click="store.toggleLock(segment.id)">
+                          <v-btn icon size="small" variant="text" :aria-label="segment.locked ? '解锁段落（需修订说明）' : '锁定段落（需修订说明）'" @click="requestToggleLock(segment.id)">
                             {{ segment.locked ? '🔒' : '🔓' }}
                           </v-btn>
                           <v-text-field :model-value="segment.label" density="compact" hide-details variant="plain" :readonly="segment.locked" :aria-label="`第 ${index + 1} 段标题`" @change="saveSegment(segment.id, 'label', $event)" />
@@ -296,10 +374,11 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                   </v-card>
                 </v-col>
               </v-row>
+              <v-empty-state v-if="!draft" icon="mdi-script-text-outline" title="该语言尚未建立文稿" text="请在“交接”页新建文稿，或从左侧语言进度切换到已有文稿。" />
             </v-window-item>
 
             <v-window-item value="versions">
-              <v-card class="script-card pa-4 pa-md-6">
+              <v-card v-if="draft" class="script-card pa-4 pa-md-6">
                 <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-5">
                   <div>
                     <div class="section-title">版本比较</div>
@@ -323,15 +402,16 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                   </div>
                   <v-list class="mt-4 bg-transparent">
                     <v-list-item v-for="version in versions" :key="version.id" :title="version.name" :subtitle="formatTime(version.createdAt)">
-                      <template #append><v-btn variant="outlined" size="small" @click="store.restoreVersion(version.id)">恢复此版</v-btn></template>
+                      <template #append><v-btn variant="outlined" size="small" @click="requestRestoreVersion(version.id)">恢复此版</v-btn></template>
                     </v-list-item>
                   </v-list>
                 </template>
               </v-card>
+              <v-empty-state v-if="!draft" icon="mdi-history" title="该语言尚无文稿" text="请先在“交接”页新建文稿。" />
             </v-window-item>
 
             <v-window-item value="preview">
-              <v-card class="script-card pa-4 pa-md-6">
+              <v-card v-if="draft" class="script-card pa-4 pa-md-6">
                 <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-5">
                   <div>
                     <div class="section-title">设备排版预览</div>
@@ -353,10 +433,11 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                   </div>
                 </div>
               </v-card>
+              <v-empty-state v-if="!draft" icon="mdi-tablet-cellphone" title="该语言尚无文稿" text="请先在“交接”页新建文稿。" />
             </v-window-item>
 
             <v-window-item value="sources">
-              <v-row>
+              <v-row v-if="draft">
                 <v-col cols="12" md="7">
                   <v-card class="script-card pa-5">
                     <div class="section-title mb-3">来源与核验记录</div>
@@ -376,10 +457,130 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                   </v-card>
                 </v-col>
               </v-row>
+              <v-empty-state v-if="!draft" icon="mdi-bookmark-multiple-outline" title="该语言尚无文稿" text="请先在“交接”页新建文稿。" />
+            </v-window-item>
+
+            <v-window-item value="handover">
+              <v-row>
+                <v-col cols="12" md="8">
+                  <v-card class="script-card pa-4 pa-md-6">
+                    <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-4">
+                      <div>
+                        <div class="section-title">交接基线</div>
+                        <div class="text-h6 font-weight-bold mt-1">{{ exhibit?.code }} · {{ exhibit?.title }}</div>
+                        <div class="text-body-2 text-medium-emphasis mt-1">
+                          <template v-if="handoverReport.baseline">基线建立于 {{ formatTime(handoverReport.baseline.createdAt) }}，记录了 {{ Object.keys(handoverReport.baseline.entries).length }} 种语言</template>
+                          <template v-else>尚未建立基线：建立后将记录三种语言当前的标题、正文与锁定段落</template>
+                        </div>
+                      </div>
+                      <v-btn color="primary" variant="tonal" prepend-icon="mdi-flag-outline" @click="baselineDialog = true">
+                        {{ handoverReport.baseline ? '重新建立基线' : '建立交接基线' }}
+                      </v-btn>
+                    </div>
+
+                    <v-alert
+                      :type="handoverReport.canHandover ? 'success' : 'warning'"
+                      variant="tonal"
+                      class="mb-4"
+                      :title="handoverReport.canHandover ? '可以交接' : '暂不可交接'"
+                    >
+                      <div v-if="handoverReport.canHandover">三种语言均有文稿，且基线之后的全部改动都有修订说明，可交给导览组。</div>
+                      <ul v-else class="mb-0 ps-4">
+                        <li v-for="(reason, index) in handoverReport.reasons" :key="index">{{ reason }}</li>
+                      </ul>
+                    </v-alert>
+
+                    <div v-for="row in handoverRows" :key="row.languageId" class="handover-row mb-3">
+                      <div class="d-flex flex-wrap align-center ga-3">
+                        <v-avatar size="36" color="grey-lighten-2">{{ LANGUAGES.find(item => item.id === row.languageId)?.shortLabel }}</v-avatar>
+                        <div class="flex-grow-1">
+                          <div class="font-weight-medium">{{ languageLabel(row.languageId) }}</div>
+                          <div class="text-caption text-medium-emphasis">
+                            <template v-if="!row.hasDraft">缺稿</template>
+                            <template v-else-if="!row.baselined">基线之后新建的文稿，未纳入基线</template>
+                            <template v-else-if="!row.changedFields.length">与基线一致，未改动</template>
+                            <template v-else>
+                              {{ row.changedFields.length }} 项已改 · {{ row.unexplainedFields.length }} 项未说明
+                            </template>
+                          </div>
+                        </div>
+                        <v-chip v-if="!row.hasDraft" color="error" size="small" variant="tonal">缺稿</v-chip>
+                        <v-chip v-else-if="!row.baselined" color="warning" size="small" variant="tonal">未纳入基线</v-chip>
+                        <v-chip v-else-if="row.unexplainedFields.length" color="warning" size="small" variant="tonal">未说明</v-chip>
+                        <v-chip v-else-if="row.changedFields.length" color="info" size="small" variant="tonal">已改 · 已说明</v-chip>
+                        <v-chip v-else color="success" size="small" variant="tonal">与基线一致</v-chip>
+                        <v-btn
+                          v-if="!row.hasDraft" size="small" variant="outlined"
+                          @click="store.createDraft(row.languageId)"
+                        >新建文稿</v-btn>
+                        <v-btn
+                          v-else-if="row.languageId !== store.selectedLanguageId" size="small" variant="text"
+                          @click="store.selectLanguage(row.languageId)"
+                        >打开</v-btn>
+                      </div>
+
+                      <div v-if="row.hasDraft && row.baselined" class="mt-3 d-flex flex-column ga-2">
+                        <div v-for="item in fieldRows(row)" :key="item.field" class="d-flex align-center ga-2 text-body-2">
+                          <v-icon size="18" :color="item.changed ? (item.explained ? 'success' : 'warning') : 'grey-lighten-1'">
+                            {{ item.changed ? (item.explained ? 'mdi-check-circle-outline' : 'mdi-alert-circle-outline') : 'mdi-circle-small' }}
+                          </v-icon>
+                          <span class="handover-field-name">{{ HANDOVER_FIELD_LABELS[item.field] }}</span>
+                          <span class="text-medium-emphasis">
+                            {{ !item.changed ? '未改动' : item.explained ? '已改动，修订说明齐全' : '已改动，缺少修订说明' }}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div v-if="row.revisions.length && row.hasDraft" class="mt-3">
+                        <div class="text-caption text-medium-emphasis mb-1">修订登记（{{ row.revisions.length }}）</div>
+                        <v-list density="compact" class="revision-list">
+                          <v-list-item v-for="revision in row.revisions" :key="revision.id">
+                            <template #prepend>
+                              <v-chip size="x-small" variant="tonal" :color="revision.field === 'segments' ? 'secondary' : 'primary'">
+                                {{ HANDOVER_FIELD_LABELS[revision.field] }}
+                              </v-chip>
+                            </template>
+                            <v-list-item-title class="text-body-2">{{ revision.note }}</v-list-item-title>
+                            <v-list-item-subtitle>{{ formatTime(revision.changedAt) }}</v-list-item-subtitle>
+                          </v-list-item>
+                        </v-list>
+                      </div>
+                    </div>
+                  </v-card>
+                </v-col>
+
+                <v-col cols="12" md="4">
+                  <v-card class="script-card pa-5 mb-5">
+                    <div class="section-title mb-3">交接判定</div>
+                    <v-list density="compact" class="bg-transparent">
+                      <v-list-item prepend-icon="mdi-flag-outline" title="已建立交接基线" :subtitle="handoverReport.baseline ? formatTime(handoverReport.baseline.createdAt) : '尚未建立'" />
+                      <v-list-item
+                        v-for="lang in LANGUAGES" :key="lang.id"
+                        :prepend-icon="handoverReport.rows.find(row => row.languageId === lang.id)?.hasDraft ? 'mdi-check' : 'mdi-close'"
+                        :title="`${lang.label}有稿`"
+                      />
+                      <v-list-item
+                        prepend-icon="mdi-note-text-outline"
+                        title="改动均有修订说明"
+                        :subtitle="handoverReport.reasons.some(reason => reason.includes('缺少修订说明')) ? '存在未说明的改动' : '无未说明改动'"
+                      />
+                    </v-list>
+                  </v-card>
+                  <v-card class="script-card pa-5">
+                    <div class="section-title mb-3">交接规则</div>
+                    <p class="text-body-2" style="line-height:1.8">
+                      建立基线时，系统按语言记录当前的标题、正文与锁定段落。之后再修改这些内容，必须填写修订说明，没有说明不会写入。
+                    </p>
+                    <p class="text-body-2 mb-0" style="line-height:1.8">
+                      只有三种语言都有稿、且所有改动都有说明时，才显示「可以交接」。重新建立基线会清空本展项之前的修订登记。
+                    </p>
+                  </v-card>
+                </v-col>
+              </v-row>
             </v-window-item>
           </v-window>
         </div>
-        <v-empty-state v-else icon="mdi-script-text-outline" title="尚未选择展项" text="请从左侧选择一个展厅和展项。" />
+        <v-empty-state v-if="!exhibit" icon="mdi-script-text-outline" title="尚未选择展项" text="请从左侧选择一个展厅和展项。" />
       </div>
     </v-main>
 
@@ -391,6 +592,52 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
           <v-text-field v-model="versionName" label="版本名称（可选）" autofocus @keyup.enter="submitVersion" />
         </v-card-text>
         <v-card-actions><v-spacer /><v-btn @click="versionDialog = false">取消</v-btn><v-btn color="primary" @click="submitVersion">保存快照</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog :model-value="baselineDialog" max-width="520" @update:model-value="baselineDialog = $event">
+      <v-card class="pa-3">
+        <v-card-title>{{ handoverReport.baseline ? '重新建立交接基线？' : '建立交接基线' }}</v-card-title>
+        <v-card-text>
+          <p class="mb-3 text-medium-emphasis">
+            将记录当前展项{{ handoverReport.baseline ? '三种' : '已有' }}语言的标题、正文和锁定段落，作为交接给导览组的对照基线。
+          </p>
+          <v-alert v-if="handoverReport.baseline" type="warning" variant="tonal" density="compact">
+            重新建立基线后，本展项之前的修订登记将被清空；基线之后仍需改动时要重新填写说明。
+          </v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn @click="baselineDialog = false">取消</v-btn>
+          <v-btn color="primary" @click="establishBaseline">{{ handoverReport.baseline ? '重新建立' : '建立基线' }}</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog :model-value="revisionDialog" max-width="520" persistent @keydown.enter.meta="confirmRevision" @keydown.enter.ctrl="confirmRevision" @update:model-value="value => !value && closeRevisionDialog()">
+      <v-card class="pa-3">
+        <v-card-title>填写修订说明</v-card-title>
+        <v-card-text>
+          <p class="mb-3 text-medium-emphasis">
+            该展项已建立交接基线。改动“{{ pendingKindLabel }}”必须填写修订说明，留空则本次改动不会写入。
+          </p>
+          <v-textarea
+            v-model="revisionNote"
+            label="修订说明（必填）"
+            rows="3"
+            auto-grow
+            autofocus
+            hint="说明改了什么、为什么改，方便交接同事核对"
+            persistent-hint
+            @keyup.enter.meta="confirmRevision"
+            @keyup.enter.ctrl="confirmRevision"
+          />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn @click="closeRevisionDialog">放弃改动</v-btn>
+          <v-btn color="primary" :disabled="!revisionNote.trim()" @click="confirmRevision">保存并登记</v-btn>
+        </v-card-actions>
       </v-card>
     </v-dialog>
 

@@ -52,10 +52,67 @@ export interface VersionSnapshot {
   draft: LanguageDraft
 }
 
+/** 纳入交接基线追踪的内容：标题、正文（讲解词）、段落锁定 */
+export type HandoverField = 'title' | 'narration' | 'segments'
+
+export interface BaselineSegment {
+  id: string
+  content: string
+}
+
+/** 建立基线时，单一语言记录的内容快照 */
+export interface BaselineEntry {
+  title: string
+  narration: string
+  lockedSegments: BaselineSegment[]
+}
+
+/** 一个展项的交接基线：按语言记录建线时的标题、正文与锁定段落 */
+export interface HandoverBaseline {
+  exhibitId: string
+  createdAt: string
+  entries: Record<string, BaselineEntry>
+}
+
+/** 基线之后一次带说明的改动登记 */
+export interface RevisionEntry {
+  id: string
+  exhibitId: string
+  languageId: string
+  field: HandoverField
+  note: string
+  changedAt: string
+}
+
+export interface HandoverFieldState {
+  changed: boolean
+  explained: boolean
+}
+
+export interface HandoverRow {
+  languageId: string
+  hasDraft: boolean
+  /** 基线中是否包含该语言（基线之后新建的文稿为 false） */
+  baselined: boolean
+  fields: Record<HandoverField, HandoverFieldState>
+  changedFields: HandoverField[]
+  unexplainedFields: HandoverField[]
+  revisions: RevisionEntry[]
+}
+
+export interface HandoverReport {
+  baseline?: HandoverBaseline
+  rows: HandoverRow[]
+  canHandover: boolean
+  reasons: string[]
+}
+
 export interface PersistedState {
   halls: Hall[]
   exhibits: Exhibit[]
   versions: VersionSnapshot[]
+  handoverBaselines: HandoverBaseline[]
+  revisions: RevisionEntry[]
   selectedHallId: string
   selectedExhibitId: string
   selectedLanguageId: string

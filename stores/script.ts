@@ -1,5 +1,14 @@
 import { defineStore } from 'pinia'
-import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, ScriptStatus, Segment, VersionSnapshot } from '~/types'
+import type {
+  Exhibit, Hall, HandoverBaseline, HandoverField, HandoverReport, Language, LanguageDraft,
+  PersistedState, RevisionEntry, ScriptStatus, Segment, VersionSnapshot
+} from '~/types'
+
+export const HANDOVER_FIELD_LABELS: Record<HandoverField, string> = {
+  title: '标题',
+  narration: '正文',
+  segments: '锁定段落'
+}
 
 export const LANGUAGES: Language[] = [
   { id: 'zh', code: 'zh-CN', label: '简体中文', shortLabel: '中' },
@@ -103,10 +112,63 @@ function demoState(): PersistedState {
       }]
     }
   ]
+  const handoverBaselines: HandoverBaseline[] = [
+    {
+      // 玉琮：三语齐稿，改动均有说明，可交接
+      exhibitId: 'exhibit-jade',
+      createdAt: '2026-09-22T01:00:00.000Z',
+      entries: {
+        zh: {
+          title: '玉琮：沟通天地的礼器',
+          narration: '这件玉琮出土于长江下游的良渚遗址。',
+          lockedSegments: [
+            { id: 'jade-zh-1', content: '这件玉琮来自距今约五千年的良渚文化。' },
+            { id: 'jade-zh-2', content: '它外方内圆，四角雕刻神人兽面纹。' }
+          ]
+        },
+        en: {
+          title: 'Jade Cong: A Ritual Object Between Heaven and Earth',
+          narration: 'This jade cong was made by the Liangzhu culture. Its square exterior and circular bore embody an early Chinese vision of the cosmos.',
+          lockedSegments: [{ id: 'jade-en-1', content: 'This jade cong is about five thousand years old.' }]
+        },
+        ja: {
+          title: '玉琮：天と地を結ぶ礼器',
+          narration: 'こちらは良渚文化の玉琮です。外側は方形、中央は円形で、四隅には神人獣面文が刻まれています。',
+          lockedSegments: []
+        }
+      }
+    },
+    {
+      // 青铜爵：中文改动未说明、日文缺稿，不可交接
+      exhibitId: 'exhibit-bronze',
+      createdAt: '2026-09-22T01:00:00.000Z',
+      entries: {
+        zh: {
+          title: '青铜爵与礼制',
+          narration: '爵是最早的青铜酒器之一。',
+          lockedSegments: []
+        },
+        en: {
+          title: 'Bronze Jue and Ritual Order',
+          narration: 'The jue was among the earliest bronze drinking vessels. Its tripod base, pouring spout, and posts were closely tied to Shang and Zhou ritual.',
+          lockedSegments: []
+        }
+      }
+    }
+  ]
+  const revisions: RevisionEntry[] = [
+    {
+      id: 'revision-jade-zh-narration', exhibitId: 'exhibit-jade', languageId: 'zh', field: 'narration',
+      note: '补充器形工艺细节：四角纹饰与新石器时代玉器工艺，导览组培训用。',
+      changedAt: '2026-09-23T08:35:00.000Z'
+    }
+  ]
   return {
     halls,
     exhibits,
     versions: [],
+    handoverBaselines,
+    revisions,
     selectedHallId: halls[0].id,
     selectedExhibitId: exhibits[0].id,
     selectedLanguageId: 'zh',
@@ -119,6 +181,8 @@ export const useScriptStore = defineStore('museum-script', {
     halls: [] as Hall[],
     exhibits: [] as Exhibit[],
     versions: [] as VersionSnapshot[],
+    handoverBaselines: [] as HandoverBaseline[],
+    revisions: [] as RevisionEntry[],
     selectedHallId: '',
     selectedExhibitId: '',
     selectedLanguageId: 'zh',
@@ -154,7 +218,12 @@ export const useScriptStore = defineStore('museum-script', {
       if (saved) {
         try {
           const data = JSON.parse(saved) as PersistedState
-          this.$patch({ ...data, hydrated: true })
+          this.$patch({
+            ...data,
+            handoverBaselines: data.handoverBaselines ?? [],
+            revisions: data.revisions ?? [],
+            hydrated: true
+          })
           if (!this.halls.length || !this.exhibits.length) this.resetDemo()
         } catch {
           this.resetDemo()
@@ -171,7 +240,10 @@ export const useScriptStore = defineStore('museum-script', {
       this.notice = '示例数据已就绪，可直接开始编辑。'
     },
     snapshot(): string {
-      return JSON.stringify({ halls: this.halls, exhibits: this.exhibits, versions: this.versions })
+      return JSON.stringify({
+        halls: this.halls, exhibits: this.exhibits, versions: this.versions,
+        handoverBaselines: this.handoverBaselines, revisions: this.revisions
+      })
     },
     commit(mutator: () => void) {
       this.past.push(this.snapshot())
@@ -185,6 +257,7 @@ export const useScriptStore = defineStore('museum-script', {
       if (typeof localStorage === 'undefined') return
       const data: PersistedState = {
         halls: this.halls, exhibits: this.exhibits, versions: this.versions,
+        handoverBaselines: this.handoverBaselines, revisions: this.revisions,
         selectedHallId: this.selectedHallId, selectedExhibitId: this.selectedExhibitId,
         selectedLanguageId: this.selectedLanguageId, lastSavedAt: this.lastSavedAt
       }
@@ -213,22 +286,113 @@ export const useScriptStore = defineStore('museum-script', {
       this.selectedLanguageId = id
       this.persist()
     },
-    updateDraft(patch: Partial<Pick<LanguageDraft, 'title' | 'narration' | 'accessibility' | 'durationMinutes' | 'sources'>>) {
+    baselineFor(exhibitId: string): HandoverBaseline | undefined {
+      return this.handoverBaselines.find(item => item.exhibitId === exhibitId)
+    },
+    revisionsFor(exhibitId: string, languageId: string): RevisionEntry[] {
+      return this.revisions
+        .filter(item => item.exhibitId === exhibitId && item.languageId === languageId)
+        .sort((a, b) => b.changedAt.localeCompare(a.changedAt))
+    },
+    /** 建立（重建）交接基线：记录三种语言当前的标题、正文与锁定段落 */
+    establishBaseline() {
+      const exhibit = this.selectedExhibit
+      if (!exhibit) return
+      this.commit(() => {
+        const entries: HandoverBaseline['entries'] = {}
+        for (const draft of exhibit.drafts) {
+          entries[draft.languageId] = {
+            title: draft.title,
+            narration: draft.narration,
+            lockedSegments: draft.segments
+              .filter(segment => segment.locked)
+              .map(segment => ({ id: segment.id, content: segment.content }))
+          }
+        }
+        this.handoverBaselines = [
+          ...this.handoverBaselines.filter(item => item.exhibitId !== exhibit.id),
+          { exhibitId: exhibit.id, createdAt: new Date().toISOString(), entries }
+        ]
+        // 重新建立基线后，旧的修订登记不再用于对照
+        this.revisions = this.revisions.filter(item => item.exhibitId !== exhibit.id)
+      })
+      this.notice = '交接基线已建立，三种语言的标题、正文与锁定段落均已记录。'
+    },
+    createDraft(languageId: string) {
+      const exhibit = this.selectedExhibit
+      if (!exhibit || exhibit.drafts.some(draft => draft.languageId === languageId)) return
+      this.commit(() => {
+        exhibit.drafts.push({
+          id: `draft-${exhibit.id}-${languageId}-${Date.now()}`,
+          languageId,
+          title: '', narration: '', accessibility: '',
+          durationMinutes: 0, sources: '', status: 'draft',
+          segments: [], updatedAt: new Date().toISOString()
+        })
+      })
+      this.selectedLanguageId = languageId
+      this.notice = '已新建空白文稿，请填写标题与正文。'
+    },
+    /** 基线之后保存标题/正文时，必须填写修订说明，否则不写入 */
+    updateDraft(
+      patch: Partial<Pick<LanguageDraft, 'title' | 'narration' | 'accessibility' | 'durationMinutes' | 'sources'>>,
+      revisionNote?: string
+    ) {
       const draft = this.selectedDraft
+      const exhibitId = this.selectedExhibitId
       if (!draft) return
-      this.commit(() => Object.assign(draft, patch, { updatedAt: new Date().toISOString() }))
-      this.notice = '改动已自动保存到浏览器。'
+      const tracked = (['title', 'narration'] as const).filter(key => key in patch && patch[key] !== draft[key])
+      if (tracked.length && this.baselineFor(exhibitId) && !revisionNote) {
+        this.notice = '基线之后改动标题或正文必须填写修订说明，未填写，本次改动未保存。'
+        return
+      }
+      this.commit(() => {
+        Object.assign(draft, patch, { updatedAt: new Date().toISOString() })
+        const note = revisionNote?.trim()
+        if (note) {
+          for (const field of tracked) {
+            this.revisions.push({
+              id: `revision-${Date.now()}-${field}`,
+              exhibitId, languageId: draft.languageId, field,
+              note, changedAt: new Date().toISOString()
+            })
+          }
+        }
+      })
+      this.notice = tracked.length
+        ? '改动已保存并登记修订说明。'
+        : '改动已自动保存到浏览器。'
     },
     updateSegment(id: string, patch: Partial<Pick<Segment, 'label' | 'content'>>) {
       const segment = this.selectedDraft?.segments.find(item => item.id === id)
       if (!segment || segment.locked) return
       this.commit(() => Object.assign(segment, patch))
     },
-    toggleLock(id: string) {
-      const segment = this.selectedDraft?.segments.find(item => item.id === id)
-      if (!segment) return
-      this.commit(() => { segment.locked = !segment.locked })
-      this.notice = segment.locked ? '段落已锁定，避免误改。' : '段落已解锁。'
+    /** 基线之后改变段落锁定，必须填写修订说明，否则不写入 */
+    toggleLock(id: string, revisionNote?: string) {
+      const draft = this.selectedDraft
+      const segment = draft?.segments.find(item => item.id === id)
+      const exhibitId = this.selectedExhibitId
+      if (!draft || !segment) return
+      const nextLocked = !segment.locked
+      if (this.baselineFor(exhibitId) && !revisionNote) {
+        this.notice = '基线之后改变段落锁定必须填写修订说明，未填写，本次操作未生效。'
+        return
+      }
+      this.commit(() => {
+        segment.locked = nextLocked
+        const note = revisionNote?.trim()
+        if (note) {
+          this.revisions.push({
+            id: `revision-${Date.now()}-segments`,
+            exhibitId, languageId: draft.languageId, field: 'segments',
+            note, changedAt: new Date().toISOString()
+          })
+        }
+      })
+      this.notice = revisionNote
+        ? `段落已${nextLocked ? '锁定' : '解锁'}，并登记修订说明。`
+        : segment.locked ? '段落已锁定，避免误改。' : '段落已解锁。'
     },
     addSegment() {
       const draft = this.selectedDraft
@@ -264,20 +428,51 @@ export const useScriptStore = defineStore('museum-script', {
       this.commit(() => this.versions.unshift(version))
       this.notice = '已保存当前版本，可在版本页比较或恢复。'
     },
-    restoreVersion(id: string) {
+    /** 基线之后恢复版本会改动标题/正文/锁定，同样需要修订说明并逐字段登记 */
+    restoreVersion(id: string, revisionNote?: string) {
       const version = this.versions.find(item => item.id === id)
       if (!version) return
+      const baseline = this.baselineFor(version.exhibitId)
+      const note = revisionNote?.trim()
+      if (baseline && !note) {
+        this.notice = '基线之后恢复版本必须填写修订说明，未填写，本次恢复未执行。'
+        return { blocked: true as const }
+      }
+      // 恢复前先取到现状，用于判断哪些追踪字段真的发生了变化
+      const exhibit = this.exhibits.find(item => item.id === version.exhibitId)
+      const before = exhibit?.drafts.find(item => item.languageId === version.languageId)
+      const restored = JSON.parse(JSON.stringify(version.draft)) as LanguageDraft
+      const changedFields: HandoverField[] = []
+      if (before && baseline) {
+        if (before.title !== restored.title) changedFields.push('title')
+        if (before.narration !== restored.narration) changedFields.push('narration')
+        if (this.lockedSignature(before.segments) !== this.lockedSignature(restored.segments)) changedFields.push('segments')
+      }
       this.commit(() => {
-        const exhibit = this.exhibits.find(item => item.id === version.exhibitId)
         if (!exhibit) return
         const index = exhibit.drafts.findIndex(item => item.languageId === version.languageId)
-        const restored = JSON.parse(JSON.stringify(version.draft)) as LanguageDraft
         if (index >= 0) exhibit.drafts[index] = restored
         else exhibit.drafts.push(restored)
+        if (note) {
+          for (const field of changedFields) {
+            this.revisions.push({
+              id: `revision-${Date.now()}-${field}`,
+              exhibitId: version.exhibitId, languageId: version.languageId,
+              field, note, changedAt: new Date().toISOString()
+            })
+          }
+        }
       })
       this.selectedExhibitId = version.exhibitId
       this.selectedLanguageId = version.languageId
-      this.notice = '版本已恢复，并作为一次可撤销操作保存。'
+      this.notice = changedFields.length
+        ? '版本已恢复，差异字段已登记修订说明。'
+        : '版本已恢复，并作为一次可撤销操作保存。'
+    },
+    lockedSignature(segments: Segment[]): string {
+      return JSON.stringify(
+        segments.filter(segment => segment.locked).map(segment => ({ id: segment.id, content: segment.content }))
+      )
     },
     undo() {
       const state = this.past.pop()
@@ -304,6 +499,53 @@ export const useScriptStore = defineStore('museum-script', {
       if (!draft) return 0
       const checks = [draft.title, draft.narration, draft.accessibility, draft.sources, draft.segments.length > 0 ? 'segments' : '']
       return Math.round(checks.filter(Boolean).length / checks.length * 100)
+    },
+    /** 交接页数据：按语言给出缺稿、已改、未说明情况，并判断是否可交接 */
+    handoverReport(exhibitId: string): HandoverReport {
+      const exhibit = this.exhibits.find(item => item.id === exhibitId)
+      const baseline = this.baselineFor(exhibitId)
+      const rows = LANGUAGES.map(language => {
+        const draft = exhibit?.drafts.find(item => item.languageId === language.id)
+        const entry = baseline?.entries[language.id]
+        const revisions = exhibit ? this.revisionsFor(exhibitId, language.id) : []
+        const stateOf = (field: HandoverField) => {
+          if (!draft || !entry) return { changed: false, explained: false }
+          let changed = false
+          if (field === 'title') changed = draft.title !== entry.title
+          else if (field === 'narration') changed = draft.narration !== entry.narration
+          else changed = this.lockedSignature(draft.segments) !== JSON.stringify(entry.lockedSegments)
+          const explained = changed && revisions.some(revision => revision.field === field)
+          return { changed, explained }
+        }
+        const states = {
+          title: stateOf('title'),
+          narration: stateOf('narration'),
+          segments: stateOf('segments')
+        }
+        const changedFields = (Object.keys(states) as HandoverField[]).filter(field => states[field].changed)
+        const unexplainedFields = changedFields.filter(field => !states[field].explained)
+        return {
+          languageId: language.id,
+          hasDraft: Boolean(draft),
+          baselined: Boolean(entry),
+          fields: states,
+          changedFields,
+          unexplainedFields,
+          revisions
+        }
+      })
+
+      const reasons: string[] = []
+      if (!baseline) reasons.push('尚未建立交接基线')
+      for (const row of rows) {
+        const label = LANGUAGES.find(item => item.id === row.languageId)?.label || row.languageId
+        if (!row.hasDraft) reasons.push(`${label}缺稿`)
+        else if (!row.baselined) reasons.push(`${label}为基线之后新建，需重新建立基线`)
+        if (row.unexplainedFields.length) {
+          reasons.push(`${label}的${row.unexplainedFields.map(field => HANDOVER_FIELD_LABELS[field]).join('、')}改动缺少修订说明`)
+        }
+      }
+      return { baseline, rows, canHandover: reasons.length === 0, reasons }
     }
   }
 })
